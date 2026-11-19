@@ -519,10 +519,11 @@ def report_issue(severity: str, title: str, summary: str, evidence: str = "", su
     return "Discord に報告しました。"
 
 
+from .fgtools import FG_TOOLS  # noqa: E402
 from .netdiag import NET_TOOLS  # noqa: E402
 
 TOOLS = [cluster_overview, list_resources, get_resource, get_pod_logs, get_events,
-         list_repo_files, read_repo_file, search_repo, propose_action, report_issue, *NET_TOOLS]
+         list_repo_files, read_repo_file, search_repo, propose_action, report_issue, *NET_TOOLS, *FG_TOOLS]
 TOOL_MAP = {f.__name__: f for f in TOOLS}
 
 
