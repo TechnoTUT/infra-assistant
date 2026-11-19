@@ -134,6 +134,16 @@
   .primary:hover { background: var(--brand-hover); }
   .primary:disabled { opacity: 0.5; cursor: default; }
   .note { color: var(--faint); font-size: 11px; margin: 8px auto 0; text-align: center; max-width: 860px; }
+  /* ---- 操作の承認 ---- */
+  .confirm { margin-top: 12px; border: 1px solid var(--ng-border); background: var(--ng-bg); border-radius: 12px; padding: 12px 14px; }
+  .confirm .what { font-weight: 600; color: var(--strong); word-break: break-all; }
+  .confirm .hint { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
+  .confirm .btns { display: flex; gap: 8px; }
+  .confirm button { border-radius: 8px; padding: 6px 14px; border: 1px solid var(--divider); background: var(--card); color: var(--text); }
+  .confirm button.go { background: var(--brand); border-color: var(--brand); color: #fff; }
+  .confirm button.go:hover { background: var(--brand-hover); }
+  .confirm button:disabled { opacity: 0.5; cursor: default; }
+  .confirm.done { border-color: var(--border); background: var(--soft); }
 </style>
 </head>
 <body>
@@ -150,7 +160,7 @@
     <div class="stats mono">
       <span class="k">Model</span><span class="v" id="model">-</span>
       <span class="sep"></span>
-      <span class="k">Access</span><span class="v">READ-ONLY</span>
+      <span class="k">Access</span><span class="v">CONFIRM TO WRITE</span>
     </div>
     <div class="badge ng" id="status"><span class="dot"></span><span id="status-text">Offline</span></div>
     <button class="icon-btn" id="reset" type="button" title="新しい会話">
@@ -168,7 +178,7 @@
       <span>送信</span>
     </button>
   </div>
-  <div class="note">AI はクラスタを読むだけで変更はしません。回答は間違えることがあるので、大事な作業は十分に注意して行うこと。<br>入力は Gemini API の無料枠に送られます。パスワードなどは書かないでください。</div>
+  <div class="note">AI がクラスタを変更するのは、画面の承認ボタンを押したときだけです。回答は間違えることがあるので、大事な作業は十分に注意して行うこと。<br>入力は Gemini API の無料枠に送られます。パスワードなどは書かないでください。</div>
 </form>
 <script>
 "use strict";
@@ -264,6 +274,27 @@ function describeTool(ev) {
     .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join(" ");
   return ev.name + (a ? " " + a : "");
 }
+function addConfirm(box, ev) {
+  const d = document.createElement("div");
+  d.className = "confirm";
+  d.innerHTML = `<div class="what"></div><div class="hint">実行すると、動いているサービスに影響することがあります。</div>
+    <div class="btns"><button class="go" type="button">実行する</button><button class="no" type="button">やめる</button></div>`;
+  d.querySelector(".what").textContent = ev.summary;
+  const [go, no] = d.querySelectorAll("button");
+  const finish = (msg) => { d.classList.add("done"); d.querySelector(".hint").textContent = msg; d.querySelector(".btns").remove(); };
+  const call = async (path) => {
+    go.disabled = no.disabled = true;
+    try {
+      const r = await fetch(`api/actions/${ev.id}/${path}`, { method: "POST" });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) return finish(j.detail || `HTTP ${r.status}`);
+      return finish(path === "approve" ? j.text : "やめました。");
+    } catch (e) { finish("エラー: " + e.message); }
+  };
+  go.onclick = () => call("approve");
+  no.onclick = () => call("reject");
+  box.appendChild(d); scroll();
+}
 function showError(box, text) {
   box.querySelector(".body").innerHTML = `<div class="alert">${ICON_ALERT}<span>${esc(text)}</span></div>`;
 }
@@ -313,6 +344,8 @@ async function ask(text) {
         } else if (ev.type === "answer") {
           answer = ev.text;
           box.querySelector(".body").innerHTML = `<div class="answer">${md(ev.text)}</div>`;
+        } else if (ev.type === "confirm") {
+          addConfirm(box, ev);
         } else if (ev.type === "error") {
           showError(box, ev.text);
         }
