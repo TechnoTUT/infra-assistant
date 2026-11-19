@@ -1,4 +1,4 @@
-"""Gemini に渡すツール。クラスタは読み取り専用、リポジトリは git-sync が置いたコピーを読む。
+"""Gemini に渡すツール。クラスタは読み取りと、画面で承認された少数の操作だけ。リポジトリは git-sync が置いたコピーを読む。
 
 ここにある関数の docstring は、そのまま Gemini へのツールの説明になる。
 Secret は RBAC で読めない (TechnoTUT/Infra の k8s/manifest/aichat/rbac.yaml) うえに、ここでも種類として受け付けない。
@@ -9,6 +9,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -331,8 +332,109 @@ def search_repo(pattern: str, path: str = "") -> str:
     return _cut("\n".join(hits) or "見つかりませんでした。")
 
 
+# ---- 書き込み (承認されたときだけ実行する) ----
+# Gemini は propose_action で「提案」するだけ。実行は main.py の承認エンドポイントが execute_action を呼ぶ。
+# 許可する namespace は k8s/manifest/aichat-rbac/rbac.yaml の RoleBinding と同じにする (RBAC でも止まる)。
+WRITE_NAMESPACES = {"cam1", "cam2", "dmxctl", "dmxsim", "live", "ndi", "plmux", "speedtest", "time"}
+ARGOCD_NS = "argocd"
+ACTIONS = {
+    "restart_pod": "Pod を削除して作り直させる",
+    "rollout_restart": "Deployment / StatefulSet / DaemonSet を順番に再起動する (rollout restart)",
+    "run_cronjob": "CronJob を今すぐ 1 回実行する (Job を作る)",
+    "argocd_refresh": "Argo CD のアプリを Git の最新に合わせて再比較する (Refresh)",
+    "argocd_sync": "Argo CD のアプリを Git の内容に同期する (Sync)",
+}
+ROLLOUT_KINDS = {"deployment": "Deployment", "statefulset": "StatefulSet", "daemonset": "DaemonSet"}
+_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+
+
+def validate_action(action: str, name: str, namespace: str = "", kind: str = "") -> dict:
+    """提案を検証して、承認の画面に出す形にする。許可されない内容は ValueError。"""
+    action, name, namespace = action.strip(), name.strip(), namespace.strip()
+    if action not in ACTIONS:
+        raise ValueError(f"対応していない操作です: {action}。使えるもの: {', '.join(ACTIONS)}")
+    if not name or len(name) > 253 or not _NAME.match(name):
+        raise ValueError(f"名前が正しくありません: {name}")
+    if action.startswith("argocd_"):
+        namespace, kind = ARGOCD_NS, ""
+    else:
+        if namespace not in WRITE_NAMESPACES:
+            raise ValueError(f"名前空間 {namespace or '(空)'} は操作できません。操作できるもの: "
+                             f"{', '.join(sorted(WRITE_NAMESPACES))}")
+        if action == "rollout_restart":
+            kind = _kind_for_rollout(kind)
+        else:
+            kind = ""
+    target = f"{kind + '/' if kind else ''}{namespace}/{name}"
+    return {"action": action, "name": name, "namespace": namespace, "kind": kind,
+            "summary": f"{ACTIONS[action]}: {target}"}
+
+
+def _kind_for_rollout(kind: str) -> str:
+    k = ALIASES.get(kind.strip().lower() or "deployment", kind.strip().lower() or "deployment")
+    if k not in ROLLOUT_KINDS:
+        raise ValueError(f"rollout_restart の kind は {', '.join(ROLLOUT_KINDS)} のどれかです。")
+    return k
+
+
+def execute_action(a: dict) -> str:
+    """承認された操作を実行する。a は validate_action の戻り値 (サーバーが保持したもの)。"""
+    a = validate_action(a["action"], a["name"], a["namespace"], a.get("kind", ""))  # 念のため再検証
+    _client()
+    act, name, ns = a["action"], a["name"], a["namespace"]
+    now = datetime.now(timezone.utc)
+    if act == "restart_pod":
+        client.CoreV1Api().delete_namespaced_pod(name, ns)
+        return f"Pod {ns}/{name} を削除しました。作り直されるまで少し待ちます。"
+    if act == "rollout_restart":
+        body = {"spec": {"template": {"metadata": {"annotations": {
+            "kubectl.kubernetes.io/restartedAt": now.isoformat()}}}}}
+        apps = client.AppsV1Api()
+        {"deployment": apps.patch_namespaced_deployment,
+         "statefulset": apps.patch_namespaced_stateful_set,
+         "daemonset": apps.patch_namespaced_daemon_set}[a["kind"]](name, ns, body)
+        return f"{a['kind']} {ns}/{name} の rollout restart を始めました。"
+    if act == "run_cronjob":
+        cj = client.BatchV1Api().read_namespaced_cron_job(name, ns)
+        job_name = f"{name[:40]}-manual-{int(time.time())}"
+        job = client.V1Job(
+            metadata=client.V1ObjectMeta(
+                name=job_name, namespace=ns,
+                labels=(cj.spec.job_template.metadata.labels if cj.spec.job_template.metadata else None),
+                annotations={"cronjob.kubernetes.io/instantiate": "manual"},
+                owner_references=[client.V1OwnerReference(
+                    api_version="batch/v1", kind="CronJob", name=name, uid=cj.metadata.uid)]),
+            spec=cj.spec.job_template.spec)
+        client.BatchV1Api().create_namespaced_job(ns, job)
+        return f"CronJob {ns}/{name} から Job {job_name} を作りました。"
+    crd = client.CustomObjectsApi()
+    app_args = ("argoproj.io", "v1alpha1", ARGOCD_NS, "applications", name)
+    if act == "argocd_refresh":
+        crd.patch_namespaced_custom_object(*app_args, {"metadata": {"annotations": {
+            "argocd.argoproj.io/refresh": "normal"}}})
+        return f"Argo CD のアプリ {name} の Refresh を依頼しました。"
+    crd.patch_namespaced_custom_object(*app_args, {"operation": {
+        "initiatedBy": {"username": "infra-assistant"}, "sync": {}}})
+    return f"Argo CD のアプリ {name} の Sync を始めました。"
+
+
+def propose_action(action: str, name: str, namespace: str = "", kind: str = "") -> str:
+    """クラスタを変更する操作を「提案」する。この関数は実行しない。画面に承認ボタンが出て、
+    ユーザーが押したときだけ実行される。提案したら、結果を待たずに、何をするか・なぜ必要か・
+    起きる影響を説明して答えを終える (実行したとは書かない)。
+
+    Args:
+        action: restart_pod (Pod を削除して作り直す) / rollout_restart (Deployment などの再起動) /
+            run_cronjob (CronJob を今すぐ 1 回実行) / argocd_refresh / argocd_sync (Argo CD のアプリ)。
+        name: 対象の名前。Argo CD の操作ではアプリの名前。
+        namespace: 対象の名前空間。Argo CD の操作では不要。
+        kind: rollout_restart のときだけ。deployment (既定) / statefulset / daemonset。
+    """
+    raise RuntimeError("propose_action は main.py が処理する")  # 呼ばれるのは宣言のため。実体は main.py
+
+
 TOOLS = [cluster_overview, list_resources, get_resource, get_pod_logs, get_events,
-         list_repo_files, read_repo_file, search_repo]
+         list_repo_files, read_repo_file, search_repo, propose_action]
 TOOL_MAP = {f.__name__: f for f in TOOLS}
 
 
