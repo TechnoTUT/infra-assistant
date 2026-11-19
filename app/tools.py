@@ -341,12 +341,16 @@ def search_repo(pattern: str, path: str = "") -> str:
 # 許可する namespace は k8s/manifest/aichat-rbac/rbac.yaml の RoleBinding と同じにする (RBAC でも止まる)。
 WRITE_NAMESPACES = {"cam1", "cam2", "dmxctl", "dmxsim", "live", "ndi", "plmux", "speedtest", "time"}
 ARGOCD_NS = "argocd"
+# ノードの cordon / uncordon を許す名前 (RBAC の resourceNames と同じ。k8s/manifest/aichat-rbac/rbac.yaml)
+WRITE_NODES = {"becky", "packard", "marie"}
 ACTIONS = {
     "restart_pod": "Pod を削除して作り直させる",
     "rollout_restart": "Deployment / StatefulSet / DaemonSet を順番に再起動する (rollout restart)",
     "run_cronjob": "CronJob を今すぐ 1 回実行する (Job を作る)",
     "argocd_refresh": "Argo CD のアプリを Git の最新に合わせて再比較する (Refresh)",
     "argocd_sync": "Argo CD のアプリを Git の内容に同期する (Sync)",
+    "cordon_node": "ノードに新しい Pod を置かせない (cordon。動いている Pod は動き続ける)",
+    "uncordon_node": "ノードに Pod を置けるように戻す (uncordon)",
 }
 ROLLOUT_KINDS = {"deployment": "Deployment", "statefulset": "StatefulSet", "daemonset": "DaemonSet"}
 _NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
@@ -361,6 +365,10 @@ def validate_action(action: str, name: str, namespace: str = "", kind: str = "")
         raise ValueError(f"名前が正しくありません: {name}")
     if action.startswith("argocd_"):
         namespace, kind = ARGOCD_NS, ""
+    elif action.endswith("_node"):
+        if name not in WRITE_NODES:
+            raise ValueError(f"ノード {name} は操作できません。操作できるもの: {', '.join(sorted(WRITE_NODES))}")
+        namespace, kind = "", ""
     else:
         if namespace not in WRITE_NAMESPACES:
             raise ValueError(f"名前空間 {namespace or '(空)'} は操作できません。操作できるもの: "
@@ -369,7 +377,7 @@ def validate_action(action: str, name: str, namespace: str = "", kind: str = "")
             kind = _kind_for_rollout(kind)
         else:
             kind = ""
-    target = f"{kind + '/' if kind else ''}{namespace}/{name}"
+    target = f"node/{name}" if action.endswith("_node") else f"{kind + '/' if kind else ''}{namespace}/{name}"
     return {"action": action, "name": name, "namespace": namespace, "kind": kind,
             "summary": f"{ACTIONS[action]}: {target}"}
 
@@ -387,6 +395,10 @@ def execute_action(a: dict) -> str:
     _client()
     act, name, ns = a["action"], a["name"], a["namespace"]
     now = datetime.now(timezone.utc)
+    if act in ("cordon_node", "uncordon_node"):
+        client.CoreV1Api().patch_node(name, {"spec": {"unschedulable": act == "cordon_node"}})
+        return (f"ノード {name} を cordon しました (新しい Pod は置かれません)。戻すときは uncordon_node。"
+                if act == "cordon_node" else f"ノード {name} を uncordon しました (Pod を置けます)。")
     if act == "restart_pod":
         client.CoreV1Api().delete_namespaced_pod(name, ns)
         return f"Pod {ns}/{name} を削除しました。作り直されるまで少し待ちます。"
@@ -429,9 +441,10 @@ def propose_action(action: str, name: str, namespace: str = "", kind: str = "") 
 
     Args:
         action: restart_pod (Pod を削除して作り直す) / rollout_restart (Deployment などの再起動) /
-            run_cronjob (CronJob を今すぐ 1 回実行) / argocd_refresh / argocd_sync (Argo CD のアプリ)。
-        name: 対象の名前。Argo CD の操作ではアプリの名前。
-        namespace: 対象の名前空間。Argo CD の操作では不要。
+            run_cronjob (CronJob を今すぐ 1 回実行) / argocd_refresh / argocd_sync (Argo CD のアプリ) /
+            cordon_node / uncordon_node (ノードに新しい Pod を置かせない / 戻す)。
+        name: 対象の名前。Argo CD の操作ではアプリの名前。ノードの操作ではノード名 (becky, packard, marie)。
+        namespace: 対象の名前空間。Argo CD とノードの操作では不要。
         kind: rollout_restart のときだけ。deployment (既定) / statefulset / daemonset。
     """
     raise RuntimeError("propose_action は main.py が処理する")  # 呼ばれるのは宣言のため。実体は main.py
