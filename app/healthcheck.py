@@ -194,19 +194,23 @@ def check_nodes_detail(core) -> list[Issue]:
 
 
 def check_cronjobs() -> list[Issue]:
-    """CronJob (healthcheck、fgtsnapshot など) の、直近に終わった Job が失敗していないか。次の実行が成功すれば解消する。"""
+    """CronJob の直近に終わった Job が失敗していて、その後に一度も成功していないものを探す。
+
+    履歴は 1 件に絞ってあり、実行中は直前の成功した Job が消えていることがある。そのため「成功したか」は、
+    履歴ではなく CronJob の status.lastSuccessfulTime (履歴を消しても残る) と比べる。"""
     batch = client.BatchV1Api()
-    latest: dict[str, tuple[datetime, bool, str]] = {}
+    last_ok = {c.metadata.name: _ts(c.status.last_successful_time) for c in batch.list_namespaced_cron_job(NAMESPACE).items}
+    failed: dict[str, tuple[datetime, str]] = {}
     for j in batch.list_namespaced_job(NAMESPACE).items:
         owner = next((o.name for o in j.metadata.owner_references or [] if o.kind == "CronJob"), None)
-        done = next((c for c in j.status.conditions or [] if c.type in ("Complete", "Failed") and c.status == "True"), None)
-        if not owner or not done:
+        f = next((c for c in j.status.conditions or [] if c.type == "Failed" and c.status == "True"), None)
+        if not owner or not f:
             continue
-        t = _ts(done.last_transition_time) or _ts(j.metadata.creation_timestamp)
-        if owner not in latest or t > latest[owner][0]:
-            latest[owner] = (t, done.type == "Failed", done.message or done.reason or "")
+        t = _ts(f.last_transition_time) or _ts(j.metadata.creation_timestamp)
+        if owner not in failed or t > failed[owner][0]:
+            failed[owner] = (t, f.message or f.reason or "")
     return [Issue(f"cronjob:{name}", "warning", f"CronJob {name} の直近の実行が失敗", msg[:300], 0, t)
-            for name, (t, failed, msg) in latest.items() if failed]
+            for name, (t, msg) in failed.items() if not (last_ok.get(name) and last_ok[name] > t)]
 
 
 def check_fortigate() -> list[Issue]:
