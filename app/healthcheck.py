@@ -1,7 +1,7 @@
 """定期のヘルスチェック。LLM は使わず、Kubernetes API などを直接見て、悪い状態が続いたら Discord に知らせる。
 
 CronJob で `python -m app.healthcheck` を 5 分ごとに動かす。状態 (いつから悪いか、通知したか) は ConfigMap に持つ。
-通知は 1 回の実行につき 1 メッセージ (新しい問題、続いている問題の再通知、復旧をまとめる)。
+通知は 1 回の実行につき 1 メッセージ (新しい問題と復旧をまとめる)。同じ問題は、復旧するまで再通知しない。
 DRY_RUN=1 なら、見つけた問題を標準出力に出すだけで、通知も状態の保存もしない。
 """
 
@@ -25,7 +25,8 @@ WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 NAMESPACE = os.environ.get("POD_NAMESPACE", "aichat")
 STATE_NAME = "healthcheck-state"
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false")
-RENOTIFY = int(os.environ.get("RENOTIFY_SECONDS", str(6 * 3600)))
+# アラームは、解除 (復旧) されるまで再通知しない。再通知したいときだけ秒数を入れる (0 = しない)
+RENOTIFY = int(os.environ.get("RENOTIFY_SECONDS", "0"))
 # 一時的な状態 (起動中、同期中) を拾わないよう、問題ごとに「これだけ続いたら通知する」を決める (秒)
 AGE_NODE = int(os.environ.get("AGE_NODE", "120"))
 AGE_POD = int(os.environ.get("AGE_POD", "300"))
@@ -231,7 +232,7 @@ def decide(issues: list[Issue], state: dict, now: float) -> tuple[list, list, li
         if now - first >= i.min_age:
             if not entry["notified"]:
                 new.append((i, now - first)); entry["notified"] = now
-            elif now - entry["notified"] >= RENOTIFY:
+            elif RENOTIFY and now - entry["notified"] >= RENOTIFY:
                 again.append((i, now - first)); entry["notified"] = now
         new_state[key] = entry
     recovered = [(s["title"], now - s["first"]) for k, s in state.items()
