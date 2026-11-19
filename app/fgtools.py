@@ -43,7 +43,7 @@ def fortigate_overview() -> str:
         out.append(f"ファームウェア: 取得できません ({e})")
     try:
         u = fg.get("monitor", "system/resource/usage") or {}
-        cur = lambda k: (u.get(k) or {}).get("current", "?")  # noqa: E731
+        cur = lambda k: fg.current(u, k) if fg.current(u, k) is not None else "?"  # noqa: E731
         out.append(f"CPU {cur('cpu')}% / メモリ {cur('mem')}% / セッション {cur('session')} / 新規セッション {cur('setuprate')}/秒")
     except fg.FortiGateError as e:
         out.append(f"負荷: 取得できません ({e})")
@@ -105,7 +105,7 @@ def fortigate_policies(search: str = "") -> str:
         h = hits.get(p.get("policyid"), {})
         line = (f"[{p.get('policyid')}] {p.get('name') or '-'}: {_names(p.get('srcintf'))}/{_names(p.get('srcaddr'))} -> "
                 f"{_names(p.get('dstintf'))}/{_names(p.get('dstaddr'))} svc={_names(p.get('service'))} {p.get('action')}"
-                f"{'' if p.get('status', 'enable') == 'enable' else ' (無効)'} hit={h.get('hit_count', '-')} "
+                f"{'' if p.get('status', 'enable') == 'enable' else ' (無効)'} hit={h.get('hit_count', 0) if h else '-'} "
                 f"最終 {_when(h.get('last_used'))}" + (f" #{p['comments']}" if p.get("comments") else ""))
         if not q or q in line.lower():
             rows.append(line)

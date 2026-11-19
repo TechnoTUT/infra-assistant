@@ -204,7 +204,7 @@ def check_fortigate() -> list[Issue]:
         return [Issue("fortigate:api", "warning", "FortiGate の API に届かない", str(e), AGE_NET)]
     out = []
     for key, label in (("cpu", "CPU"), ("mem", "メモリ")):
-        cur = (u.get(key) or {}).get("current")
+        cur = fg.current(u, key)
         if isinstance(cur, (int, float)) and cur >= float(os.environ.get("FORTIGATE_MAX_PERCENT", "90")):
             out.append(Issue(f"fortigate:{key}", "warning", f"FortiGate の {label} が高い",
                              f"{label} {cur}% (VXLAN の転送は CPU で処理している)", AGE_POD))
