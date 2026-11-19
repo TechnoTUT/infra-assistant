@@ -1,7 +1,7 @@
 """定期のヘルスチェック。LLM は使わず、Kubernetes API などを直接見て、悪い状態が続いたら Discord に知らせる。
 
 CronJob で `python -m app.healthcheck` を 5 分ごとに動かす。状態 (いつから悪いか、通知したか) は ConfigMap に持つ。
-通知は 1 回の実行につき 1 メッセージ (新しい問題と復旧をまとめる)。同じ問題は、復旧するまで再通知しない。
+通知は 1 回の実行につき 1 メッセージ (新しい問題、重大度が上がった問題、復旧をまとめる)。同じ状態の間は再通知しない。
 DRY_RUN=1 なら、見つけた問題を標準出力に出すだけで、通知も状態の保存もしない。
 """
 
@@ -294,25 +294,35 @@ def save_state(core, state: dict) -> None:
         core.create_namespaced_config_map(NAMESPACE, body)
 
 
-def decide(issues: list[Issue], state: dict, now: float) -> tuple[list, list, list, dict]:
-    """(新しい問題, 続いている問題の再通知, 復旧, 新しい状態)。"""
-    new_state, new, again = {}, [], []
+RANK = {"warning": 1, "critical": 2}
+
+
+def decide(issues: list[Issue], state: dict, now: float) -> tuple[list, list, list, list, dict]:
+    """(新しい問題, 悪化した問題, 再通知, 復旧, 新しい状態)。
+
+    悪化は、通知済みの問題の重大度が上がったとき (警告 -> 重大)。下がったときは通知しない。"""
+    new_state, new, worse, again = {}, [], [], []
     seen = {i.key: i for i in issues}
     for key, i in seen.items():
         s = state.get(key, {})
         first = s.get("first") or (i.since.timestamp() if i.since else now)
         if i.since:
             first = min(first, i.since.timestamp())
-        entry = {"first": first, "notified": s.get("notified", 0), "title": i.title}
+        was = s.get("severity", i.severity)    # 古い状態には重大度がない = 変化なし
+        entry = {"first": first, "notified": s.get("notified", 0), "title": i.title, "severity": i.severity}
         if now - first >= i.min_age:
             if not entry["notified"]:
                 new.append((i, now - first)); entry["notified"] = now
+            elif RANK[i.severity] > RANK[was]:
+                worse.append((i, now - first)); entry["notified"] = now
             elif RENOTIFY and now - entry["notified"] >= RENOTIFY:
                 again.append((i, now - first)); entry["notified"] = now
+        else:
+            entry["severity"] = was if entry["notified"] else i.severity
         new_state[key] = entry
     recovered = [(s["title"], now - s["first"]) for k, s in state.items()
                  if k not in seen and s.get("notified")]
-    return new, again, recovered, new_state
+    return new, worse, again, recovered, new_state
 
 
 def _dur(sec: float) -> str:
@@ -320,9 +330,9 @@ def _dur(sec: float) -> str:
     return f"{sec // 3600} 時間 {sec % 3600 // 60} 分" if sec >= 3600 else f"{sec // 60} 分"
 
 
-def notify(new, again, recovered) -> None:
+def notify(new, worse, again, recovered) -> None:
     embeds = []
-    for label, group in (("新しい問題", new), ("まだ続いている問題", again)):
+    for label, group in (("新しい問題", new), ("悪化した問題", worse), ("まだ続いている問題", again)):
         for i, age in group[:8]:
             color, jp = SEVERITY[i.severity]
             embeds.append({"title": f"[{jp}] {i.title}", "color": color, "description": i.detail[:900] or "-",
@@ -353,17 +363,18 @@ def main() -> int:
         return 0
     now = time.time()
     state = load_state(core)
-    new, again, recovered, new_state = decide(issues, state, now)
-    if (new or again or recovered) and WEBHOOK:
+    new, worse, again, recovered, new_state = decide(issues, state, now)
+    changed = new or worse or again or recovered
+    if changed and WEBHOOK:
         try:
-            notify(new, again, recovered)
+            notify(new, worse, again, recovered)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             print(f"discord failed: {e}", file=sys.stderr)
             return 1    # 状態を保存しない = 次の実行でもう一度通知する
-    elif new or again or recovered:
+    elif changed:
         print("DISCORD_WEBHOOK_URL が未設定のため、通知しません", file=sys.stderr)
     save_state(core, new_state)
-    print(f"issues={len(issues)} new={len(new)} again={len(again)} recovered={len(recovered)}")
+    print(f"issues={len(issues)} new={len(new)} worse={len(worse)} again={len(again)} recovered={len(recovered)}")
     return 0
 
 
