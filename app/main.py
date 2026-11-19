@@ -22,7 +22,7 @@ from google.genai import errors, types
 from pydantic import BaseModel, Field
 
 from .prompt import SYSTEM_PROMPT
-from .tools import TOOLS, call_tool
+from .tools import TOOLS, call_tool, execute_action, validate_action
 
 log = logging.getLogger("aichat")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -33,6 +33,7 @@ MAX_STEPS = int(os.environ.get("MAX_TOOL_STEPS", "10"))  # 1 回の質問でツ�
 MAX_HISTORY = 20       # モデルに渡す過去のやりとりの数
 MAX_MESSAGE = 4000     # 1 つの発言の文字数の上限
 JOB_TTL = 600          # 終わったジョブを覚えておく秒数
+ACTION_TTL = 600       # 承認待ちの操作を覚えておく秒数 (過ぎたら承認できない)
 # 無料枠のレート制限があるので、同時に動かす質問の数を絞る
 SLOTS = threading.Semaphore(int(os.environ.get("MAX_CONCURRENT", "2")))
 
@@ -72,6 +73,30 @@ class Job:
 
 JOBS: dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
+# 承認待ちの操作。内容はサーバーが持ち、ブラウザは ID だけを送る (内容は差し替えられない)
+PENDING: dict[str, tuple[float, dict]] = {}
+PENDING_LOCK = threading.Lock()
+MAX_PENDING = 50
+
+
+def _propose(job: Job, args: dict) -> str:
+    try:
+        a = validate_action(str(args.get("action", "")), str(args.get("name", "")),
+                            str(args.get("namespace", "")), str(args.get("kind", "")))
+    except ValueError as e:
+        return f"エラー: {e}"
+    now = time.time()
+    with PENDING_LOCK:
+        for k in [k for k, (t, _) in PENDING.items() if now - t > ACTION_TTL]:
+            del PENDING[k]
+        if len(PENDING) >= MAX_PENDING:
+            return "エラー: 承認待ちの操作が多すぎます。少し待ってください。"
+        action_id = uuid.uuid4().hex
+        PENDING[action_id] = (now, a)
+    job.emit(type="confirm", id=action_id, **a)
+    log.info("proposed %s %s", action_id, a["summary"])
+    return ("承認待ちにしました。まだ実行していません。ユーザーが画面の承認ボタンを押したときだけ実行されます。"
+            "何をするか、なぜ必要か、起きる影響を説明して答えを終えてください。")
 
 
 def _gc() -> None:
@@ -121,7 +146,7 @@ def _run(job: Job, req: ChatRequest) -> None:
                 args = dict(fc.args or {})
                 job.emit(type="tool", name=fc.name, args=args)
                 log.info("tool %s %s", fc.name, args)
-                result = call_tool(fc.name, args)
+                result = _propose(job, args) if fc.name == "propose_action" else call_tool(fc.name, args)
                 parts.append(types.Part.from_function_response(name=fc.name, response={"result": result}))
             # 関数の結果は user の発言として返す (API は user と model の role しか受け付けない)
             contents.append(types.Content(role="user", parts=parts))
@@ -173,3 +198,31 @@ def job_status(job_id: str, after: int = 0) -> dict:
         raise HTTPException(404, "ジョブが見つかりません。ページを読み込み直してください。")
     with job.lock:
         return {"events": job.events[after:], "next": len(job.events), "done": job.done}
+
+
+def _take(action_id: str) -> dict:
+    """承認待ちの操作を 1 回だけ取り出す (二重実行を防ぐ)。"""
+    with PENDING_LOCK:
+        item = PENDING.pop(action_id, None)
+    if item is None or time.time() - item[0] > ACTION_TTL:
+        raise HTTPException(404, "この操作は期限切れか、すでに処理されています。もう一度質問してください。")
+    return item[1]
+
+
+@app.post("/api/actions/{action_id}/approve")
+def approve(action_id: str) -> dict:
+    a = _take(action_id)
+    log.warning("approved %s", a["summary"])
+    try:
+        return {"ok": True, "text": execute_action(a)}
+    except Exception as e:  # noqa: BLE001
+        log.exception("action failed")
+        reason = getattr(e, "reason", None) or type(e).__name__
+        return {"ok": False, "text": f"実行できませんでした: {reason}"}
+
+
+@app.post("/api/actions/{action_id}/reject")
+def reject(action_id: str) -> dict:
+    a = _take(action_id)
+    log.info("rejected %s", a["summary"])
+    return {"ok": True}
