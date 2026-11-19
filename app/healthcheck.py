@@ -36,6 +36,10 @@ CRASH_REASONS = {"CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "Create
 # 名前が引けるか確かめる (Pod の DNS = CoreDNS 経由。外部の名前と、FortiGate が答える内部の名前)
 DNS_NAMES = [n for n in os.environ.get("DNS_NAMES", "github.com,ai.svc.technotut.net").split(",") if n]
 HTTP_URLS = [u for u in os.environ.get("HTTP_URLS", "https://github.com").split(",") if u]
+# ノードの検査 (DaemonSet nodecheck が返す事実を、ここで判定する)
+EXPECT_DNS = [n for n in os.environ.get("EXPECT_NODE_DNS", "").split(",") if n]       # 空なら見ない
+EXPECT_DEVICES = dict(p.split("=", 1) for p in os.environ.get("EXPECT_NODE_DEVICES", "").split(";") if "=" in p)
+MIN_DISK_FREE = float(os.environ.get("MIN_DISK_FREE_PERCENT", "10"))
 SEVERITY = {"warning": (0xF59E0B, "警告"), "critical": (0xC7000A, "重大")}
 
 
@@ -159,6 +163,35 @@ def check_argocd(custom) -> list[Issue]:
     return out
 
 
+def check_nodes_detail(core) -> list[Issue]:
+    """全ノードの nodecheck に聞いて、設定のズレ (resolv.conf、USB デバイス、ディスク) を見つける。"""
+    out = []
+    pods = core.list_namespaced_pod(NAMESPACE, label_selector="app=nodecheck").items
+    for p in pods:
+        node = p.spec.node_name or p.metadata.name
+        if not p.status.pod_ip or p.status.phase != "Running":
+            continue   # Pod が動いていないことは check_pods が見る
+        try:
+            with urllib.request.urlopen(f"http://{p.status.pod_ip}:9100/status", timeout=5) as r:
+                st = json.load(r)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            out.append(Issue(f"nodecheck:{node}:unreachable", "warning", f"ノード {node} の nodecheck に届かない",
+                             type(e).__name__, AGE_POD))
+            continue
+        if EXPECT_DNS and st["resolv_nameservers"] != EXPECT_DNS:
+            out.append(Issue(f"node:{node}:resolv", "critical", f"ノード {node} の DNS 設定がずれている",
+                             f"/etc/resolv.conf の nameserver = {st['resolv_nameservers'] or '(なし)'}、期待は {EXPECT_DNS}。"
+                             "Ansible の common ロールで固定している", AGE_NET))
+        for dev in [d for d in EXPECT_DEVICES.get(node, "").split(",") if d]:
+            if dev not in st["devices"]:
+                out.append(Issue(f"node:{node}:device:{dev}", "warning", f"ノード {node} に {dev} がない",
+                                 f"USB デバイスが認識されていません (認識中: {st['devices'] or 'なし'})", AGE_POD))
+        if st["disk_free_percent"] < MIN_DISK_FREE:
+            out.append(Issue(f"node:{node}:disk", "warning", f"ノード {node} のディスクの空きが少ない",
+                             f"空き {st['disk_free_percent']}% (しきい値 {MIN_DISK_FREE}%)", AGE_POD))
+    return out
+
+
 def check_network() -> list[Issue]:
     out = []
     for name in DNS_NAMES:
@@ -184,7 +217,7 @@ def check_network() -> list[Issue]:
 def collect(core, custom) -> list[Issue]:
     issues: list[Issue] = []
     for name, fn in (("nodes", lambda: check_nodes(core)), ("pods", lambda: check_pods(core)),
-                     ("pvcs", lambda: check_pvcs(core)), ("lb", lambda: check_lb(core)),
+                     ("node-detail", lambda: check_nodes_detail(core)), ("pvcs", lambda: check_pvcs(core)), ("lb", lambda: check_lb(core)),
                      ("argocd", lambda: check_argocd(custom)), ("network", check_network)):
         try:
             issues += fn()
