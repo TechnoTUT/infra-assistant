@@ -1,27 +1,76 @@
 # infra-assistant
 
-TechnoTUT のインフラについて、Gemini API のモデル (`gemini-3.8-flash`) が日本語で答える Web チャットです。
-クラスタは ServiceAccount で読みます。変更は、画面の承認ボタンを押したときだけ (Pod の再作成、rollout restart、CronJob の手動実行、Argo CD の Refresh / Sync)。リポジトリは git-sync が取り込んだものを読みます。
+A web chat that answers questions about TechnoTUT's infrastructure in Japanese, using a Gemini API model (`gemini-3.8-flash`). It inspects the Kubernetes cluster, the FortiGate and the network, and reads the [TechnoTUT/Infra](https://github.com/TechnoTUT/Infra) repository (docs and manifests, synced by git-sync).
 
-- 使い方: [https://network.technotut.net/service/aichat](https://network.technotut.net/service/aichat)
-- 仕組みと運用: [https://network.technotut.net/computing/aichat](https://network.technotut.net/computing/aichat)
-- マニフェスト: [k8s/manifest/aichat/](https://github.com/TechnoTUT/Infra/tree/main/k8s/manifest/aichat) (Infra リポジトリ。イメージは `ghcr.io/technotut/infra-assistant`)
+The repository also holds the jobs that watch the infrastructure around the chat. Those jobs never call an LLM.
 
-| ファイル | 内容 |
+- Read-only by default: the cluster is read through a read-only ServiceAccount, and the FortiGate through a read-only API user.
+- Changes happen only after a person presses the approve button in the UI: restarting a Pod, a rollout restart, running a CronJob by hand, an Argo CD refresh or sync, and cordon or uncordon of a node.
+- The Gemini API is on the paid tier. Questions and cluster information are sent to an external service, so the chat is not allowed to read Secrets.
+
+The documentation lives in the Infra repository and is written in Japanese:
+
+- User guide: <https://network.technotut.net/service/aichat>
+- Implementation and operations: <https://network.technotut.net/computing/aichat>
+- Monitoring and notifications: <https://network.technotut.net/computing/monitoring>
+- Manifests: [k8s/manifest/aichat/](https://github.com/TechnoTUT/Infra/tree/main/k8s/manifest/aichat) (image `ghcr.io/technotut/infra-assistant`), [aichat-rbac/](https://github.com/TechnoTUT/Infra/tree/main/k8s/manifest/aichat-rbac) and [netprobe/](https://github.com/TechnoTUT/Infra/tree/main/k8s/manifest/netprobe)
+
+## Layout
+
+### The chat (a Deployment)
+
+| File | Purpose |
 | --- | --- |
-| `app/main.py` | API (ジョブの作成とポーリング) と Gemini とのやりとり |
-| `app/netdiag.py` | ネットワーク診断のツール (ping、DNS、TCP、HTTP) |
-| `netprobe/` | VLAN (VXLAN) につないで診断のパケットを出す検証用コンテナ (別イメージ `netprobe`) |
-| `app/healthcheck.py` | 定期のヘルスチェック (LLM を使わない。CronJob で動かし、問題を Discord に通知) |
-| `app/fortigate.py` / `app/fgtools.py` | FortiGate の読み取り専用 API のクライアントと、チャットのツール |
-| `app/fgtsnapshot.py` | FortiGate の設定のスナップショットと変更の検知 (LLM を使わない。CronJob) |
-| `app/nodecheck.py` | ノードの事実 (resolv.conf、USB、ディスク) を返す (DaemonSet) |
-| `app/tools.py` | Gemini に渡すツールと、承認された操作の実行 |
-| `app/prompt.py` | システムプロンプト |
-| `app/static/index.html` | チャットの画面 |
+| `app/main.py` | HTTP API (job creation and polling, approve and reject endpoints) and the conversation with Gemini |
+| `app/tools.py` | Tools given to Gemini (cluster, repository, `propose_action`, `report_issue`) and the execution of approved actions |
+| `app/netdiag.py` | Network diagnostics (ping, DNS, TCP, HTTP from the Pod) and `vlan_probe`, which starts a `netprobe` Pod on demand |
+| `app/fortigate.py` | Read-only FortiGate REST client (GET only, allowlisted paths) |
+| `app/fgtools.py` | FortiGate tools for the chat (policies with hit counts, DHCP leases, routes, interfaces, load) |
+| `app/discord.py` | Discord webhook helper (mentions disabled) |
+| `app/prompt.py` | System prompt |
+| `app/static/index.html` | Chat UI, including the approve button |
 
-## 手元で動かす
+### Monitoring jobs (no LLM)
+
+They run from the same image with a different command.
+
+| File | Run as | Purpose |
+| --- | --- | --- |
+| `app/healthcheck.py` | CronJob, every 5 minutes | Checks nodes, Pods, PVCs, LoadBalancer Services, Argo CD apps, failed CronJobs, DNS and HTTP from inside a Pod, FortiGate reachability and load, and node drift. Notifies Discord when the state changes (new problem, escalation, recovery). |
+| `app/nodecheck.py` | DaemonSet | Serves facts about each node (`resolv.conf`, USB serial devices, free disk) read from read-only mounts of the host's `/etc` and `/dev`. `healthcheck` judges them. |
+| `app/fgtsnapshot.py` | CronJob, every 5 minutes | Snapshots the main FortiGate configuration tables through the read-only API and reports differences to Discord. |
+
+### netprobe (a separate image)
+
+`netprobe/` is a small API that sends diagnostic packets (ping, arping, traceroute, DNS, TCP, HTTP) from inside a VLAN. It is attached to a VLAN through vxlan-cni and uses per-VLAN policy routing. The chat starts it on demand, and it is deleted a few minutes after use. See `netprobe/Containerfile` and `netprobe/app/main.py`.
+
+## Run locally
+
 ```bash
 uv sync
-GEMINI_API_KEY=<キー> REPO_DIR=<Infra の clone> uv run uvicorn app.main:app --reload
+GEMINI_API_KEY=<key> REPO_DIR=<path to a clone of the Infra repository> uv run uvicorn app.main:app --reload
 ```
+
+Open <http://localhost:8000>. The cluster is reached with your local kubeconfig. The FortiGate, Discord and netprobe features are disabled unless their environment variables are set.
+
+| Variable | Meaning |
+| --- | --- |
+| `GEMINI_API_KEY` | Gemini API key (required) |
+| `GEMINI_MODEL` | Model name (default `gemini-3.8-flash`) |
+| `REPO_DIR` | Path of the Infra repository that the chat reads |
+| `MAX_CONCURRENT` | Number of questions processed at the same time |
+| `DISCORD_WEBHOOK_URL` | Discord webhook for reports, approvals and notifications |
+| `FORTIGATE_TOKEN` | Token of the read-only FortiGate API user |
+| `NETPROBE_IMAGE` | Image of the on-demand netprobe Pod (empty disables `vlan_probe`) |
+| `APPROVER_CIDRS` | Comma-separated CIDRs that may approve actions (empty means no restriction) |
+
+The monitoring jobs can be tried without side effects (no notification, no state saved):
+
+```bash
+DRY_RUN=1 uv run python -m app.healthcheck
+DRY_RUN=1 uv run python -m app.fgtsnapshot
+```
+
+## Build
+
+Both images are built by GitHub Actions (`.github/workflows/image.yaml`) and pushed to `ghcr.io/technotut/infra-assistant` and `ghcr.io/technotut/netprobe`. `main` gets the tags `main` and `sha-<commit>`; pull requests only build. The monitoring jobs in the Infra repository pin `sha-<commit>`, so update those tags when the jobs change.
