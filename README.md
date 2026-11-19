@@ -12,6 +12,7 @@ TechnoTUT のインフラについて、Gemini API のモデル (`gemini-3.8-fla
 | `app/main.py` | API (ジョブの作成とポーリング) と Gemini とのやりとり |
 | `app/netdiag.py` | ネットワーク診断のツール (ping、DNS、TCP、HTTP) |
 | `netprobe/` | VLAN (VXLAN) につないで診断のパケットを出す検証用コンテナ (別イメージ `netprobe`) |
+| `app/healthcheck.py` | 定期のヘルスチェック (LLM を使わない。CronJob で動かし、問題を Discord に通知) |
 | `app/tools.py` | Gemini に渡すツールと、承認された操作の実行 |
 | `app/prompt.py` | システムプロンプト |
 | `app/static/index.html` | チャットの画面 |
