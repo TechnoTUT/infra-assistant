@@ -1,6 +1,6 @@
 name: image
 
-# Containerfile をビルドし、ghcr.io/technotut/infra-assistant に push する。
+# infra-assistant (ルートの Containerfile) と netprobe (netprobe/Containerfile) をビルドして ghcr.io/technotut に push する。
 # main は :main と :sha-<commit>、PR はビルドだけ (push しない)。
 on:
   push:
@@ -15,8 +15,13 @@ permissions:
 
 jobs:
   build:
-    name: Build image
+    name: Build ${{ matrix.image }}
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - { image: infra-assistant, context: ., file: Containerfile }
+          - { image: netprobe, context: netprobe, file: netprobe/Containerfile }
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -36,7 +41,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/technotut/infra-assistant
+          images: ghcr.io/technotut/${{ matrix.image }}
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-
@@ -44,10 +49,10 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: Containerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
