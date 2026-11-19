@@ -14,13 +14,16 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+import ipaddress
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel, Field
 
+from . import discord
 from .prompt import SYSTEM_PROMPT
 from .tools import TOOLS, call_tool, execute_action, validate_action
 
@@ -77,6 +80,8 @@ JOBS_LOCK = threading.Lock()
 PENDING: dict[str, tuple[float, dict]] = {}
 PENDING_LOCK = threading.Lock()
 MAX_PENDING = 50
+# 承認できる送信元 (カンマ区切りの CIDR)。空なら制限しない。ログインがないので、送信元の IP で絞る
+APPROVER_CIDRS = [ipaddress.ip_network(c.strip()) for c in os.environ.get("APPROVER_CIDRS", "").split(",") if c.strip()]
 
 
 def _propose(job: Job, args: dict) -> str:
@@ -209,20 +214,55 @@ def _take(action_id: str) -> dict:
     return item[1]
 
 
-@app.post("/api/actions/{action_id}/approve")
-def approve(action_id: str) -> dict:
-    a = _take(action_id)
-    log.warning("approved %s", a["summary"])
+def _client_ip(request: Request) -> str:
+    """送信元の IP。Envoy (Cilium Ingress) が X-Forwarded-For の末尾に本当の送信元を足すので、その末尾を使う。"""
+    xff = request.headers.get("x-forwarded-for", "")
+    return xff.split(",")[-1].strip() if xff else (request.client.host if request.client else "?")
+
+
+def _check_approver(ip: str) -> None:
+    if not APPROVER_CIDRS:
+        return
     try:
-        return {"ok": True, "text": execute_action(a)}
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(403, "送信元を確認できないため、承認できません。") from None
+    if not any(addr in net for net in APPROVER_CIDRS):
+        raise HTTPException(403, "この場所からは操作を承認できません。")
+
+
+def _audit(kind: str, a: dict, ip: str, result: str, ok: bool = True) -> None:
+    """承認・却下を Discord に残す (誰かはわからないので、送信元の IP と時刻を残す)。"""
+    color = {"approved": 0xF59E0B, "rejected": 0x94A3B8}[kind] if ok else 0xC7000A
+    label = {"approved": "承認して実行", "rejected": "却下"}[kind]
+    discord.post([{"title": f"[操作] {label}: {a['summary']}", "color": color,
+                   "fields": [{"name": "結果", "value": result[:900] or "-"},
+                              {"name": "送信元", "value": ip}],
+                   "footer": {"text": "infra-assistant の承認ボタン"}}])
+
+
+@app.post("/api/actions/{action_id}/approve")
+def approve(action_id: str, request: Request) -> dict:
+    ip = _client_ip(request)
+    _check_approver(ip)
+    a = _take(action_id)
+    log.warning("approved %s from %s", a["summary"], ip)
+    try:
+        text = execute_action(a)
+        _audit("approved", a, ip, text)
+        return {"ok": True, "text": text}
     except Exception as e:  # noqa: BLE001
         log.exception("action failed")
         reason = getattr(e, "reason", None) or type(e).__name__
+        _audit("approved", a, ip, f"実行できませんでした: {reason}", ok=False)
         return {"ok": False, "text": f"実行できませんでした: {reason}"}
 
 
 @app.post("/api/actions/{action_id}/reject")
-def reject(action_id: str) -> dict:
+def reject(action_id: str, request: Request) -> dict:
+    ip = _client_ip(request)
+    _check_approver(ip)
     a = _take(action_id)
-    log.info("rejected %s", a["summary"])
+    log.info("rejected %s from %s", a["summary"], ip)
+    _audit("rejected", a, ip, "実行しませんでした")
     return {"ok": True}
