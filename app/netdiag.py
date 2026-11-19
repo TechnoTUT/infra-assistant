@@ -198,14 +198,134 @@ def http_check(url: str) -> str:
     return "\n".join(out)
 
 
-NETPROBE_URL = os.environ.get("NETPROBE_URL", "")
+# ---- VLAN 側からの診断 (netprobe の Pod をその場で起動する) ----
+# 常駐させず、必要になったときにサーバーが Pod を作る。Pod の仕様はここに固定で、AI が選べるのは VLAN だけ。
+# 使い終わって IDLE_SECONDS 経つと消す。取りこぼしても activeDeadlineSeconds で Pod が自分で止まる。
+NETPROBE_IMAGE = os.environ.get("NETPROBE_IMAGE", "")          # 空なら無効
+NETPROBE_NS = os.environ.get("NETPROBE_NAMESPACE", "netprobe")
+# Pod が選べる VLAN と、その VLAN のゲートウェイ。k8s の vxlan_cni_allowed_vlans (Ansible) の範囲に合わせる
+NETPROBE_VLANS = {10: "10.10.0.1", 20: "10.10.16.1"}
+IDLE_SECONDS = 300
+START_TIMEOUT = 90
+POD_DEADLINE = 900
+_last_used: dict[int, float] = {}
+_launch_lock = threading.Lock()
+_reaper_started = False
+_core = None
+
+
+def _api():
+    global _core
+    if _core is None:
+        from kubernetes import client, config
+        try:
+            config.load_incluster_config()
+        except config.ConfigException:
+            config.load_kube_config()
+        _core = client.CoreV1Api()
+    return _core
+
+
+def _pod_spec(vlan: int):
+    from kubernetes import client
+    nad = json.dumps([{"name": "vxlan", "namespace": "kube-public", "interface": f"net{vlan}",
+                       "cni-args": {"vlan": vlan}}])
+    return client.V1Pod(
+        metadata=client.V1ObjectMeta(
+            name=f"netprobe-vlan{vlan}", namespace=NETPROBE_NS,
+            labels={"app": "netprobe", "vlan": str(vlan)},
+            annotations={"k8s.v1.cni.cncf.io/networks": nad}),
+        spec=client.V1PodSpec(
+            restart_policy="Never", automount_service_account_token=False,
+            active_deadline_seconds=POD_DEADLINE, termination_grace_period_seconds=2,
+            security_context=client.V1PodSecurityContext(seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault")),
+            containers=[client.V1Container(
+                name="netprobe", image=NETPROBE_IMAGE, image_pull_policy="Always",
+                env=[client.V1EnvVar(name="VLAN_GATEWAYS", value=f"{vlan}={NETPROBE_VLANS[vlan]}")],
+                ports=[client.V1ContainerPort(name="http", container_port=8080)],
+                readiness_probe=client.V1Probe(
+                    http_get=client.V1HTTPGetAction(path="/readyz", port="http"), period_seconds=2),
+                resources=client.V1ResourceRequirements(
+                    requests={"cpu": "20m", "memory": "64Mi"}, limits={"memory": "256Mi"}),
+                # raw ソケットと経路の設定に必要な NET_RAW と NET_ADMIN だけ。root なのは、非 root だと
+                # Pod に足した capability が実効にならないため。Pod の netns の中に限る
+                security_context=client.V1SecurityContext(
+                    run_as_user=0, allow_privilege_escalation=False, read_only_root_filesystem=True,
+                    capabilities=client.V1Capabilities(drop=["ALL"], add=["NET_RAW", "NET_ADMIN"])))]))
+
+
+def _ready_ip(pod) -> str | None:
+    st = pod.status
+    if st and st.phase == "Running" and st.pod_ip and any(
+            c.type == "Ready" and c.status == "True" for c in st.conditions or []):
+        return st.pod_ip
+    return None
+
+
+def _ensure_netprobe(vlan: int) -> str:
+    """VLAN 用の netprobe の Pod を (なければ作って) Ready になるまで待ち、その IP を返す。"""
+    from kubernetes.client import ApiException
+    name = f"netprobe-vlan{vlan}"
+    with _launch_lock:
+        try:
+            pod = _api().read_namespaced_pod(name, NETPROBE_NS)
+            if pod.metadata.deletion_timestamp or pod.status.phase in ("Succeeded", "Failed"):
+                _api().delete_namespaced_pod(name, NETPROBE_NS, grace_period_seconds=0)
+                deadline = time.time() + 20
+                while time.time() < deadline:   # 消えるまで待ってから作り直す
+                    try:
+                        _api().read_namespaced_pod(name, NETPROBE_NS)
+                        time.sleep(1)
+                    except ApiException as e:
+                        if e.status == 404:
+                            break
+                        raise
+                pod = None
+        except ApiException as e:
+            if e.status != 404:
+                raise
+            pod = None
+        if pod is None:
+            _api().create_namespaced_pod(NETPROBE_NS, _pod_spec(vlan))
+        _start_reaper()
+    deadline = time.time() + START_TIMEOUT
+    while time.time() < deadline:
+        pod = _api().read_namespaced_pod(name, NETPROBE_NS)
+        if (ip := _ready_ip(pod)):
+            _last_used[vlan] = time.time()
+            return ip
+        if pod.status.phase == "Failed":
+            break
+        time.sleep(2)
+    raise ValueError(f"VLAN {vlan} の検証用 Pod が {START_TIMEOUT} 秒以内に準備できませんでした。"
+                     "VLAN の DHCP が取れていない可能性があります (Pod の状態は get_events で見る)。")
+
+
+def _start_reaper() -> None:
+    global _reaper_started
+    if _reaper_started:
+        return
+    _reaper_started = True
+
+    def loop() -> None:
+        while True:
+            time.sleep(30)
+            for vlan, t in list(_last_used.items()):
+                if time.time() - t > IDLE_SECONDS:
+                    try:
+                        _api().delete_namespaced_pod(f"netprobe-vlan{vlan}", NETPROBE_NS)
+                    except Exception:  # noqa: BLE001  消せなくても activeDeadlineSeconds で止まる
+                        pass
+                    _last_used.pop(vlan, None)
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def vlan_probe(vlan: int, check: str, target: str, port: int = 0, count: int = 4,
                record_type: str = "A", server: str = "") -> str:
-    """VLAN (DJ=10、AV=20) につないだ検証用コンテナ netprobe から、診断のパケットを出す。ping などの
-    ツールは Pod のネットワークから出るが、これは VLAN の機器と同じ側から出るので、「VLAN からつながらない」
-    「FortiGate のポリシーで止まっていないか」「VLAN の DHCP / DNS は生きているか」の切り分けに使う。
+    """VLAN (DJ=10、AV=20) の側から診断のパケットを出す。必要になったときに検証用の Pod を VLAN につないで
+    起動する (初回は数十秒かかる。使い終わって数分で消える)。ping などのツールは Pod のネットワークから出るが、
+    これは VLAN の機器と同じ側から出るので、「VLAN からつながらない」「FortiGate のポリシーで止まっていないか」
+    「VLAN の DHCP / DNS は生きているか」の切り分けに使う。Pod から出す ping などで足りるときは使わない。
 
     Args:
         vlan: 10 (DJ) か 20 (AV)。
@@ -216,14 +336,24 @@ def vlan_probe(vlan: int, check: str, target: str, port: int = 0, count: int = 4
         record_type: dns のときの種類 (A, AAAA, CNAME, MX, NS, TXT, PTR, SRV)。
         server: dns のとき問い合わせる DNS サーバーの IP。空なら VLAN のゲートウェイ (FortiGate)。
     """
-    if not NETPROBE_URL:
-        return "VLAN 側からの診断は設定されていません (NETPROBE_URL が未設定)。"
-    body = json.dumps({"vlan": int(vlan), "check": check, "target": target, "port": int(port),
+    if not NETPROBE_IMAGE:
+        return "VLAN 側からの診断は設定されていません (NETPROBE_IMAGE が未設定)。"
+    vlan = int(vlan)
+    if vlan not in NETPROBE_VLANS:
+        raise ValueError(f"VLAN {vlan} は使えません。使えるもの: {sorted(NETPROBE_VLANS)}")
+    try:
+        ip = _ensure_netprobe(vlan)
+    except ValueError:
+        raise
+    except Exception as e:  # noqa: BLE001  API エラーなど
+        raise ValueError(f"検証用 Pod を起動できませんでした ({type(e).__name__}: {getattr(e, 'reason', '')})。") from e
+    body = json.dumps({"vlan": vlan, "check": check, "target": target, "port": int(port),
                        "count": int(count), "record_type": record_type, "server": server}).encode()
-    req = urllib.request.Request(NETPROBE_URL.rstrip("/") + "/v1/probe", data=body,
+    req = urllib.request.Request(f"http://{ip}:8080/v1/probe", data=body,
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
+            _last_used[vlan] = time.time()
             return json.load(r)["result"]
     except urllib.error.HTTPError as e:
         try:
@@ -232,7 +362,7 @@ def vlan_probe(vlan: int, check: str, target: str, port: int = 0, count: int = 4
             detail = ""
         raise ValueError(f"netprobe のエラー ({e.code}): {detail}") from e
     except (urllib.error.URLError, TimeoutError) as e:
-        raise ValueError(f"netprobe に届きませんでした ({type(e).__name__})。Pod が起動しているか確認する。") from e
+        raise ValueError(f"netprobe に届きませんでした ({type(e).__name__})。") from e
 
 
 NET_TOOLS = [ping, dns_lookup, tcp_check, http_check, vlan_probe]

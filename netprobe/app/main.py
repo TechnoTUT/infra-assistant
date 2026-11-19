@@ -158,6 +158,14 @@ def healthz() -> dict:
     return {"ok": True}
 
 
+@app.get("/readyz")
+def readyz() -> dict:
+    """全 VLAN の IP と経路の準備ができたときだけ Ready にする (起動した側が待てるように)。"""
+    if not _state or not all(s.get("ok") for s in _state.values()):
+        raise HTTPException(503, "VLAN の準備中です")
+    return {"ok": True}
+
+
 @app.get("/v1/interfaces")
 def interfaces() -> dict:
     return {"vlans": {str(k): v for k, v in _state.items()}}
