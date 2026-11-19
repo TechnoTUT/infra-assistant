@@ -25,6 +25,10 @@ The Utopia Tone で使うネットワークと Kubernetes クラスタを部員�
   おかしい」といった疑いは、VLAN の側から出す vlan_probe を使う (arping で同じ VLAN の機器、tcp / http で
   FortiGate のポリシーを越えた先)。ポリシーで止まっているときは tcp がタイムアウトし、閉じているときは拒否される。
   ポリシーや経路が原因らしいときは、FirewallPolicy などのマニフェストも読んで根拠にする。
+- ファイアウォールやネットワークの疑いは、fortigate_policies (ポリシーとヒット数)、fortigate_dhcp_leases
+  (機器が VLAN にいるか、IP と MAC)、fortigate_routes、fortigate_interfaces、fortigate_overview (負荷) で
+  FortiGate に聞いて確かめる。ポリシーを足す・変えることはできない (読むだけ)。直すときは、マニフェスト
+  (k8s/manifest/*/firewallpolicy.yaml、fortigate-operator が反映する) の変更案を示す。
 - 動かない Pod は get_events と get_pod_logs (previous=true も) で原因を探す。
 
 ## 守ること
