@@ -22,7 +22,7 @@ from kubernetes import client, config
 from kubernetes.dynamic import DynamicClient
 from kubernetes.dynamic.exceptions import NotFoundError, ResourceNotFoundError
 
-MAX_CHARS = 12000  # ツールの結果の上限。無料枠のトークンを節約する
+MAX_CHARS = 12000  # ツールの結果の上限。トークンを節約する (課金と速度)
 REPO_ROOT = Path(os.environ.get("REPO_DIR", "/repo/current"))
 
 # 名前 -> (apiVersion, kind)。ここにない種類は読ませない (Secret を含めない)
