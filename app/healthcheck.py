@@ -309,7 +309,9 @@ def decide(issues: list[Issue], state: dict, now: float) -> tuple[list, list, li
         if i.since:
             first = min(first, i.since.timestamp())
         was = s.get("severity", i.severity)    # 古い状態には重大度がない = 変化なし
-        entry = {"first": first, "notified": s.get("notified", 0), "title": i.title, "severity": i.severity}
+        # 状態に持つのは、これまでの最高の重大度。下がっても保つので、警告と重大を行き来しても、悪化を繰り返し通知しない
+        entry = {"first": first, "notified": s.get("notified", 0), "title": i.title,
+                 "severity": max(was, i.severity, key=RANK.get)}
         if now - first >= i.min_age:
             if not entry["notified"]:
                 new.append((i, now - first)); entry["notified"] = now
@@ -317,8 +319,8 @@ def decide(issues: list[Issue], state: dict, now: float) -> tuple[list, list, li
                 worse.append((i, now - first)); entry["notified"] = now
             elif RENOTIFY and now - entry["notified"] >= RENOTIFY:
                 again.append((i, now - first)); entry["notified"] = now
-        else:
-            entry["severity"] = was if entry["notified"] else i.severity
+        elif not entry["notified"]:
+            entry["severity"] = i.severity
         new_state[key] = entry
     recovered = [(s["title"], now - s["first"]) for k, s in state.items()
                  if k not in seen and s.get("notified")]
