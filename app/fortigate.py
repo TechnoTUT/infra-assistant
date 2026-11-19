@@ -52,3 +52,11 @@ def get(kind: str, path: str, params: dict | None = None, timeout: int = 20):
         raise FortiGateError(f"FortiGate API のエラー ({e.code})") from e
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
         raise FortiGateError(f"FortiGate API に届きません ({type(e).__name__})") from e
+
+
+def current(usage: dict, key: str):
+    """resource/usage の値は、辞書のことも、1 要素のリストのこともある。現在値を返す (なければ None)。"""
+    v = (usage or {}).get(key)
+    if isinstance(v, list):
+        v = v[0] if v else None
+    return v.get("current") if isinstance(v, dict) else None
