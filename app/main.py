@@ -34,7 +34,7 @@ MAX_HISTORY = 20       # モデルに渡す過去のやりとりの数
 MAX_MESSAGE = 4000     # 1 つの発言の文字数の上限
 JOB_TTL = 600          # 終わったジョブを覚えておく秒数
 ACTION_TTL = 600       # 承認待ちの操作を覚えておく秒数 (過ぎたら承認できない)
-# 無料枠のレート制限があるので、同時に動かす質問の数を絞る
+# レート制限と課金を抑えるため、同時に動かす質問の数を絞る
 SLOTS = threading.Semaphore(int(os.environ.get("MAX_CONCURRENT", "2")))
 
 STATIC = Path(__file__).parent / "static"
@@ -108,7 +108,7 @@ def _gc() -> None:
 
 def _friendly(e: errors.APIError) -> str:
     if e.code == 429:
-        return ("Gemini API の無料枠の上限に達しました。少し待ってから (1 日の上限なら明日) "
+        return ("Gemini API のレート制限 (または利用の上限) に達しました。少し待って"
                 "もう一度試してください。")
     if e.code in (401, 403) or (e.code == 400 and "API key" in (e.message or "")):
         return "Gemini API キーが正しくないようです。管理者に連絡してください。"
