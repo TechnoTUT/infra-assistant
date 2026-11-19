@@ -193,6 +193,22 @@ def check_nodes_detail(core) -> list[Issue]:
     return out
 
 
+def check_cronjobs() -> list[Issue]:
+    """CronJob (healthcheck、fgtsnapshot など) の、直近に終わった Job が失敗していないか。次の実行が成功すれば解消する。"""
+    batch = client.BatchV1Api()
+    latest: dict[str, tuple[datetime, bool, str]] = {}
+    for j in batch.list_namespaced_job(NAMESPACE).items:
+        owner = next((o.name for o in j.metadata.owner_references or [] if o.kind == "CronJob"), None)
+        done = next((c for c in j.status.conditions or [] if c.type in ("Complete", "Failed") and c.status == "True"), None)
+        if not owner or not done:
+            continue
+        t = _ts(done.last_transition_time) or _ts(j.metadata.creation_timestamp)
+        if owner not in latest or t > latest[owner][0]:
+            latest[owner] = (t, done.type == "Failed", done.message or done.reason or "")
+    return [Issue(f"cronjob:{name}", "warning", f"CronJob {name} の直近の実行が失敗", msg[:300], 0, t)
+            for name, (t, failed, msg) in latest.items() if failed]
+
+
 def check_fortigate() -> list[Issue]:
     """FortiGate の API に届くか、CPU とメモリが高すぎないか (トークンがなければ見ない)。"""
     from . import fortigate as fg
@@ -237,13 +253,17 @@ def collect(core, custom) -> list[Issue]:
     issues: list[Issue] = []
     for name, fn in (("nodes", lambda: check_nodes(core)), ("pods", lambda: check_pods(core)),
                      ("node-detail", lambda: check_nodes_detail(core)), ("pvcs", lambda: check_pvcs(core)), ("lb", lambda: check_lb(core)),
-                     ("argocd", lambda: check_argocd(custom)), ("network", check_network), ("fortigate", check_fortigate)):
+                     ("argocd", lambda: check_argocd(custom)), ("network", check_network), ("fortigate", check_fortigate), ("cronjobs", check_cronjobs)):
         try:
             issues += fn()
         except ApiException as e:   # チェック自体の失敗は、そのチェックだけ飛ばす (RBAC の不足など)
             print(f"check {name} failed: {e.status} {e.reason}", file=sys.stderr)
             issues.append(Issue(f"check:{name}", "warning", f"ヘルスチェック '{name}' が実行できない",
                                 f"{e.status} {e.reason}。ClusterRole を確認", 600))
+        except Exception as e:  # noqa: BLE001  想定外の例外でも、ほかのチェックと通知は止めない
+            print(f"check {name} crashed: {type(e).__name__}: {e}", file=sys.stderr)
+            issues.append(Issue(f"check:{name}", "warning", f"ヘルスチェック '{name}' が例外で止まった",
+                                f"{type(e).__name__}: {str(e)[:200]}", 600))
     return issues
 
 
