@@ -10,6 +10,7 @@ TechnoTUT のインフラについて、Gemini API のモデル (`gemini-3.8-fla
 | ファイル | 内容 |
 | --- | --- |
 | `app/main.py` | API (ジョブの作成とポーリング) と Gemini とのやりとり |
+| `app/netdiag.py` | ネットワーク診断のツール (ping、DNS、TCP、HTTP) |
 | `app/tools.py` | Gemini に渡すツールと、承認された操作の実行 |
 | `app/prompt.py` | システムプロンプト |
 | `app/static/index.html` | チャットの画面 |
