@@ -204,7 +204,9 @@ def http_check(url: str) -> str:
 NETPROBE_IMAGE = os.environ.get("NETPROBE_IMAGE", "")          # 空なら無効
 NETPROBE_NS = os.environ.get("NETPROBE_NAMESPACE", "netprobe")
 # Pod が選べる VLAN と、その VLAN のゲートウェイ。k8s の vxlan_cni_allowed_vlans (Ansible) の範囲に合わせる
-NETPROBE_VLANS = {10: "10.10.0.1", 20: "10.10.16.1"}
+# VLAN 30 (LBAR) は DHCP サーバがなく、Pod に IP が付かないので入れない
+NETPROBE_VLANS = {10: "10.10.0.1", 20: "10.10.16.1", 40: "192.168.12.1", 42: "192.168.12.33",
+                  43: "192.168.12.49", 44: "192.168.12.65", 45: "192.168.12.81"}
 IDLE_SECONDS = 300
 START_TIMEOUT = 90
 POD_DEADLINE = 900
@@ -322,13 +324,13 @@ def _start_reaper() -> None:
 
 def vlan_probe(vlan: int, check: str, target: str, port: int = 0, count: int = 4,
                record_type: str = "A", server: str = "") -> str:
-    """VLAN (DJ=10、AV=20) の側から診断のパケットを出す。必要になったときに検証用の Pod を VLAN につないで
+    """VLAN (DJ=10、AV=20、PA=40、ENTRANCE=42、LDISP=43、CAM1=44、CAM2=45) の側から診断のパケットを出す。必要になったときに検証用の Pod を VLAN につないで
     起動する (初回は数十秒かかる。使い終わって数分で消える)。ping などのツールは Pod のネットワークから出るが、
     これは VLAN の機器と同じ側から出るので、「VLAN からつながらない」「FortiGate のポリシーで止まっていないか」
     「VLAN の DHCP / DNS は生きているか」の切り分けに使う。Pod から出す ping などで足りるときは使わない。
 
     Args:
-        vlan: 10 (DJ) か 20 (AV)。
+        vlan: 10 (DJ)、20 (AV)、40 (PA)、42 (ENTRANCE)、43 (LDISP)、44 (CAM1)、45 (CAM2)。
         check: ping / arping (同じ VLAN の機器の MAC を ARP で確かめる) / traceroute / dns / tcp / http。
         target: 宛先の IP アドレスかホスト名。http のときは URL。dns のときは引く名前。名前は VLAN の DNS で引く。
         port: tcp のときのポート番号 (22, 53, 80, 443, 445, 2049, 8000, 8080, 8443 など)。
