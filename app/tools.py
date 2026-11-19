@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import json
 import re
+import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -433,8 +437,77 @@ def propose_action(action: str, name: str, namespace: str = "", kind: str = "") 
     raise RuntimeError("propose_action は main.py が処理する")  # 呼ばれるのは宣言のため。実体は main.py
 
 
+# ---- Discord への報告 ----
+# 調べて見つかった問題を、Webhook で Discord に知らせる。画面にログインがなく誰でも質問できるので、
+# 件数を絞り、同じ内容は繰り返さず、メンションは無効にする。URL は Secret (環境変数) から読む。
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+REPORT_LIMIT = (5, 600)        # 10 分に 5 件まで
+REPORT_DEDUPE = 1800           # 同じ題名は 30 分は再送しない
+_reports: list[tuple[float, str]] = []
+_reports_lock = threading.Lock()
+SEVERITY = {"info": (0x3B82F6, "情報"), "warning": (0xF59E0B, "警告"), "critical": (0xC7000A, "重大")}
+# 秘密らしい値を送らない (ログに混ざっていたときの保険)
+_SECRET_RX = re.compile(
+    r"(?i)(password|passwd|secret|token|api[_-]?key|authorization|bearer)(\s*[=:]\s*|\s+)\S+|"
+    r"https://discord(app)?\.com/api/webhooks/\S+|AIza[0-9A-Za-z_-]{20,}")
+
+
+def _scrub(text: str, limit: int) -> str:
+    text = _SECRET_RX.sub("[伏せました]", text.strip())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def report_issue(severity: str, title: str, summary: str, evidence: str = "", suggestion: str = "") -> str:
+    """調べて実際に見つかった問題を、運用担当の Discord に知らせる。ツールで確かめた事実があるときだけ使う。
+    推測、ドキュメントの質問、すでに解決した問題、ユーザーが頼んでいない軽い警告では呼ばない。
+    1 つの問題につき 1 回だけ呼ぶ。呼んだら、報告したことをユーザーに伝える。
+
+    Args:
+        severity: info (様子見でよい) / warning (対応が必要) / critical (サービスが止まっている、イベントに影響する)。
+        title: 問題の題名 (1 行。例: "dmxctl の Pod が CrashLoopBackOff")。
+        summary: 何が起きているか。いつから、どこで、影響は何か。
+        evidence: 根拠 (ツールで見たイベントやログの要点。長すぎないように)。秘密らしい値は書かない。
+        suggestion: 対処の案 (任意)。
+    """
+    if not DISCORD_WEBHOOK_URL:
+        return "Discord への報告は設定されていません。ユーザーに、管理者へ直接伝えるよう案内してください。"
+    sev = severity.strip().lower()
+    if sev not in SEVERITY:
+        raise ValueError(f"severity は {', '.join(SEVERITY)} のどれかです。")
+    title = _scrub(title.replace("\n", " "), 200)
+    if not title or not summary.strip():
+        raise ValueError("title と summary は必須です。")
+    now = time.time()
+    with _reports_lock:
+        _reports[:] = [r for r in _reports if now - r[0] < max(REPORT_LIMIT[1], REPORT_DEDUPE)]
+        if any(t == title and now - at < REPORT_DEDUPE for at, t in _reports):
+            return "同じ題名の報告を最近送ったので、重ねて送りませんでした。"
+        if sum(1 for at, _ in _reports if now - at < REPORT_LIMIT[1]) >= REPORT_LIMIT[0]:
+            return "報告が多いので今は送れません。しばらく待つか、管理者へ直接伝えるよう案内してください。"
+        _reports.append((now, title))
+    fields = [("影響・状況", summary, 1000), ("根拠", evidence, 1000), ("対処の案", suggestion, 600)]
+    color, label = SEVERITY[sev]
+    embed = {
+        "title": f"[{label}] {title}", "color": color,
+        "fields": [{"name": n, "value": _scrub(v, lim)} for n, v, lim in fields if v.strip()],
+        "footer": {"text": "infra-assistant (AI チャットの調査結果。内容は要確認)"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    body = json.dumps({"username": "Infra Assistant", "embeds": [embed],
+                       "allowed_mentions": {"parse": []}}).encode()
+    req = urllib.request.Request(DISCORD_WEBHOOK_URL, data=body, headers={
+        "Content-Type": "application/json", "User-Agent": "infra-assistant"})
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except (urllib.error.URLError, TimeoutError) as e:
+        with _reports_lock:
+            _reports[:] = [r for r in _reports if r[1] != title]  # 失敗は数えず、あとで再送できるように
+        return f"Discord に送れませんでした ({type(e).__name__})。ユーザーに、管理者へ直接伝えるよう案内してください。"
+    return "Discord に報告しました。"
+
+
 TOOLS = [cluster_overview, list_resources, get_resource, get_pod_logs, get_events,
-         list_repo_files, read_repo_file, search_repo, propose_action]
+         list_repo_files, read_repo_file, search_repo, propose_action, report_issue]
 TOOL_MAP = {f.__name__: f for f in TOOLS}
 
 
