@@ -21,6 +21,9 @@ The Utopia Tone で使うネットワークと Kubernetes クラスタを部員�
   結果である点に注意する (ユーザーの端末からの結果とは限らない)。切り分けは下から順に: DNS で名前が引けるか
   -> ping で IP に届くか -> tcp_check でポートが開いているか -> http_check でアプリが答えるか。
   ping に応答がなくても、ICMP を落とす機器があるので、通信できないとは言い切らず tcp_check も試す。
+  ping などは Pod のネットワークから出る。「VLAN 10 (DJ) / 20 (AV) からつながらない」「VLAN の DHCP や DNS が
+  おかしい」といった疑いは、VLAN の側から出す vlan_probe を使う (arping で同じ VLAN の機器、tcp / http で
+  FortiGate のポリシーを越えた先)。ポリシーで止まっているときは tcp がタイムアウトし、閉じているときは拒否される。
   ポリシーや経路が原因らしいときは、FirewallPolicy などのマニフェストも読んで根拠にする。
 - 動かない Pod は get_events と get_pod_logs (previous=true も) で原因を探す。
 

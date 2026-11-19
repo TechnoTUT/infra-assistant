@@ -9,6 +9,10 @@
 from __future__ import annotations
 
 import ipaddress
+import json
+import os
+import urllib.error
+import urllib.request
 import socket
 import ssl
 import threading
@@ -194,4 +198,41 @@ def http_check(url: str) -> str:
     return "\n".join(out)
 
 
-NET_TOOLS = [ping, dns_lookup, tcp_check, http_check]
+NETPROBE_URL = os.environ.get("NETPROBE_URL", "")
+
+
+def vlan_probe(vlan: int, check: str, target: str, port: int = 0, count: int = 4,
+               record_type: str = "A", server: str = "") -> str:
+    """VLAN (DJ=10、AV=20) につないだ検証用コンテナ netprobe から、診断のパケットを出す。ping などの
+    ツールは Pod のネットワークから出るが、これは VLAN の機器と同じ側から出るので、「VLAN からつながらない」
+    「FortiGate のポリシーで止まっていないか」「VLAN の DHCP / DNS は生きているか」の切り分けに使う。
+
+    Args:
+        vlan: 10 (DJ) か 20 (AV)。
+        check: ping / arping (同じ VLAN の機器の MAC を ARP で確かめる) / traceroute / dns / tcp / http。
+        target: 宛先の IP アドレスかホスト名。http のときは URL。dns のときは引く名前。名前は VLAN の DNS で引く。
+        port: tcp のときのポート番号 (22, 53, 80, 443, 445, 2049, 8000, 8080, 8443 など)。
+        count: ping と arping の回数 (1〜10)。
+        record_type: dns のときの種類 (A, AAAA, CNAME, MX, NS, TXT, PTR, SRV)。
+        server: dns のとき問い合わせる DNS サーバーの IP。空なら VLAN のゲートウェイ (FortiGate)。
+    """
+    if not NETPROBE_URL:
+        return "VLAN 側からの診断は設定されていません (NETPROBE_URL が未設定)。"
+    body = json.dumps({"vlan": int(vlan), "check": check, "target": target, "port": int(port),
+                       "count": int(count), "record_type": record_type, "server": server}).encode()
+    req = urllib.request.Request(NETPROBE_URL.rstrip("/") + "/v1/probe", data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)["result"]
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.load(e).get("detail", "")
+        except ValueError:
+            detail = ""
+        raise ValueError(f"netprobe のエラー ({e.code}): {detail}") from e
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise ValueError(f"netprobe に届きませんでした ({type(e).__name__})。Pod が起動しているか確認する。") from e
+
+
+NET_TOOLS = [ping, dns_lookup, tcp_check, http_check, vlan_probe]

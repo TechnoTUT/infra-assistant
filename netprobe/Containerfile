@@ -1,0 +1,17 @@
+FROM python:3.13-slim
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /usr/local/bin/uv
+# 診断に使うコマンド。iputils-ping / iputils-arping / traceroute / tcpdump は NET_RAW、iproute2 は NET_ADMIN を使う
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iproute2 iputils-ping iputils-arping traceroute tcpdump \
+ && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+WORKDIR /srv
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-cache
+COPY app ./app
+ENV PATH="/srv/.venv/bin:$PATH"
+# raw ソケットと経路の設定のために root で動かす。Pod 側で capability を NET_RAW と NET_ADMIN だけにする
+# (非 root では、Pod に足した capability が実効にならない)
+EXPOSE 8080
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
