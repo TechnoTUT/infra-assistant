@@ -193,6 +193,24 @@ def check_nodes_detail(core) -> list[Issue]:
     return out
 
 
+def check_fortigate() -> list[Issue]:
+    """FortiGate の API に届くか、CPU とメモリが高すぎないか (トークンがなければ見ない)。"""
+    from . import fortigate as fg
+    if not fg.configured():
+        return []
+    try:
+        u = fg.get("monitor", "system/resource/usage") or {}
+    except fg.FortiGateError as e:
+        return [Issue("fortigate:api", "warning", "FortiGate の API に届かない", str(e), AGE_NET)]
+    out = []
+    for key, label in (("cpu", "CPU"), ("mem", "メモリ")):
+        cur = (u.get(key) or {}).get("current")
+        if isinstance(cur, (int, float)) and cur >= float(os.environ.get("FORTIGATE_MAX_PERCENT", "90")):
+            out.append(Issue(f"fortigate:{key}", "warning", f"FortiGate の {label} が高い",
+                             f"{label} {cur}% (VXLAN の転送は CPU で処理している)", AGE_POD))
+    return out
+
+
 def check_network() -> list[Issue]:
     out = []
     for name in DNS_NAMES:
@@ -219,7 +237,7 @@ def collect(core, custom) -> list[Issue]:
     issues: list[Issue] = []
     for name, fn in (("nodes", lambda: check_nodes(core)), ("pods", lambda: check_pods(core)),
                      ("node-detail", lambda: check_nodes_detail(core)), ("pvcs", lambda: check_pvcs(core)), ("lb", lambda: check_lb(core)),
-                     ("argocd", lambda: check_argocd(custom)), ("network", check_network)):
+                     ("argocd", lambda: check_argocd(custom)), ("network", check_network), ("fortigate", check_fortigate)):
         try:
             issues += fn()
         except ApiException as e:   # チェック自体の失敗は、そのチェックだけ飛ばす (RBAC の不足など)
